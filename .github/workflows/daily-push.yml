@@ -1,5 +1,5 @@
 # 每日打卡卡云端推送：每天北京时间 09:10 执行（GitHub Actions 按 UTC 调度，01:10 UTC = 09:10 UTC+8）
-# 注意：GitHub 定时任务可能有几分钟
+# 注意：GitHub 定时任务可能有几分钟的延迟，属正常现象
 name: 每日打卡卡推送
 
 on:
@@ -20,5 +20,4 @@ jobs:
       - name: 生成并推送打卡卡
         env:
           BARK_DEVICE_KEY: ${{ secrets.BARK_DEVICE_KEY }}
-          BARK_SERVER: ${{ secrets.BARK_SERVER }}
         run: python scripts/push.py
