@@ -139,7 +139,8 @@ def send_bark(title, body):
     if not key:
         print("错误：未设置 BARK_DEVICE_KEY 环境变量（GitHub Secrets 中配置）")
         sys.exit(1)
-    server = os.environ.get("BARK_SERVER", "https://api.day.app").rstrip("/")
+    # 注意用 or 兜底：若环境变量存在但为空串（Secret 未配置时 GitHub 会注入空值），也回退到默认服务器
+    server = os.environ.get("BARK_SERVER") or "https://api.day.app"
     payload = json.dumps({"device_key": key, "title": title, "body": body, "group": "省考打卡"}).encode("utf-8")
     req = urllib.request.Request(
         f"{server}/push", data=payload, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
