@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""省考每日打卡卡云端推送脚本（仅使用 Python 标准库，GitHub Actions 无需安装依赖）。
+"""行测申论每日学习云端推送脚本（仅使用 Python 标准库，GitHub Actions 无需安装依赖）。
 
-流程：抓取当日新闻 -> 按星期从题库轮换小练习 -> 组装打卡卡 -> 通过 Bark 推送到 iPhone。
+流程：抓取当日新闻（全国政策为主线）-> 加载当月题库 -> 组装每日学习内容 -> 通过 Bark 推送到 iPhone。
+题库按月分目录存放（data/YYYY-MM），脚本按当月取值；当月目录不存在时回退到最新可用月份。
 配置项全部走环境变量（GitHub Secrets / 本地 export）：
   BARK_DEVICE_KEY  Bark 推送密钥（必填，从 Bark App 首页复制）
   BARK_SERVER      Bark 服务器，默认 https://api.day.app
@@ -21,10 +22,15 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 WEEKDAY_FILES = {0: "mon.json", 1: "tue.json", 2: "wed.json", 3: "thu.json", 4: "fri.json", 5: "sat.json", 6: "sun.json"}
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 NEWS_APIS = ["https://60s.viki.moe/v2/60s", "https://60s-cf.viki.moe/v2/60s"]
-# 与公考相关度较高的关键词，用于从新闻列表中挑选优先条目
-KEYWORDS = ["经济", "改革", "政策", "广东", "深圳", "广州", "大湾区", "发展", "建设", "科技",
-            "数据", "增长", "会晤", "国家", "人工智能", "就业", "民生", "乡村", "教育",
-            "医疗", "外贸", "进出口", "房价", "金融", "生态", "治理"]
+# 新闻相关度权重：全国性政策/时政为主线（权重高），广东/深圳本地新闻为辅线（权重低）
+KEYWORD_WEIGHTS = {
+    "国家": 3, "中央": 3, "国务院": 3, "政策": 3, "改革": 3, "法治": 3, "会议": 3,
+    "高质量发展": 3, "新质生产力": 3, "乡村振兴": 3, "生态文明": 3,
+    "经济": 2, "科技": 2, "民生": 2, "就业": 2, "教育": 2, "医疗": 2, "养老": 2,
+    "外交": 2, "会晤": 2, "发展": 2, "建设": 2, "治理": 2, "数据": 2, "增长": 2,
+    "金融": 2, "外贸": 2, "进出口": 2, "人工智能": 2, "安全": 2, "乡村": 2, "生态": 2,
+    "广东": 1, "深圳": 1, "广州": 1, "大湾区": 1,
+}
 # 每个星期对应的小练习标题
 EXERCISE_LABELS = {0: "成语辨析5题", 1: "类比推理5题", 2: "数字推理3题", 3: "常识判断5题",
                    4: "定义判断3题", 5: "资料分析2小题", 6: "综合小测5题"}
@@ -38,6 +44,24 @@ TASKS = [
     "申论素材摘抄 1条",
     "错题回顾 3-5道",
 ]
+
+
+def resolve_data_dir(now):
+    """定位当月题库目录 data/YYYY-MM；目录缺失或为空时回退到最新可用月份/根目录。"""
+    month_dir = os.path.join(DATA_DIR, now.strftime("%Y-%m"))
+    if _has_data(month_dir):
+        return month_dir
+    # 回退：取 data 下所有 YYYY-MM 目录中最新（字典序最大）且含数据的一个
+    months = sorted(d for d in os.listdir(DATA_DIR)
+                    if len(d) == 7 and d[4] == "-" and _has_data(os.path.join(DATA_DIR, d)))
+    if months:
+        return os.path.join(DATA_DIR, months[-1])
+    return DATA_DIR  # 无月份目录时兼容旧的扁平结构
+
+
+def _has_data(d):
+    """判断目录存在且包含至少一个 json 数据文件。"""
+    return os.path.isdir(d) and any(f.endswith(".json") for f in os.listdir(d))
 
 
 def fetch_news():
@@ -56,8 +80,9 @@ def fetch_news():
 
 
 def pick_news(news, n=5):
-    """按公考相关度关键词打分排序，取前 n 条。"""
-    scored = [(sum(1 for k in KEYWORDS if k in item), i, item) for i, item in enumerate(news)]
+    """按公考相关度加权打分排序，取前 n 条；全国政策为主线、广东/深圳本地为辅线。"""
+    scored = [(sum(w for k, w in KEYWORD_WEIGHTS.items() if k in item), i, item)
+              for i, item in enumerate(news)]
     scored.sort(key=lambda x: (-x[0], x[1]))  # 分数降序，同分保持原顺序
     return [item for _, _, item in scored[:n]]
 
@@ -76,7 +101,7 @@ def shuffle_options(s, now):
 
 def load_set(now):
     """按星期加载对应题库文件，按 ISO 周数在 4 套中轮换。"""
-    path = os.path.join(DATA_DIR, WEEKDAY_FILES[now.weekday()])
+    path = os.path.join(resolve_data_dir(now), WEEKDAY_FILES[now.weekday()])
     with open(path, encoding="utf-8") as f:
         sets = json.load(f)["sets"]
     s = sets[now.isocalendar()[1] % len(sets)]
@@ -85,10 +110,36 @@ def load_set(now):
 
 
 def load_shenlun(now):
-    """申论素材按日期在年内序数取模，28 条循环。"""
-    with open(os.path.join(DATA_DIR, "shenlun.json"), encoding="utf-8") as f:
+    """申论素材按日期在年内序数取模循环。"""
+    with open(os.path.join(resolve_data_dir(now), "shenlun.json"), encoding="utf-8") as f:
         items = json.load(f)["items"]
     return items[now.timetuple().tm_yday % len(items)]
+
+
+def load_knowledge(now):
+    """加载每日知识点：常识判断 2 条 + 言语理解 2 条，按年内天数轮换。"""
+    with open(os.path.join(resolve_data_dir(now), "knowledge.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    day = now.timetuple().tm_yday
+    common, lang = data["common_sense"], data["language"]
+    # 每天取 2 条、步长为 2，避免相邻两天内容大量重复
+    cs = [common[(day * 2) % len(common)], common[(day * 2 + 1) % len(common)]]
+    lg = [lang[(day * 2) % len(lang)], lang[(day * 2 + 1) % len(lang)]]
+    return {"common": cs, "language": lg}
+
+
+def format_knowledge(know):
+    """输出知识点文本：常识按「要点+考查角度+易错点」，言语按「释义+色彩+搭配+易混」。"""
+    lines = ["【今日知识点】"]
+    for k in know["common"]:
+        lines.append(f"· {k['point']}：{k['detail']}")
+        lines.append(f"　考查角度：{k['angle']}")
+        lines.append(f"　易错点：{k['pitfall']}")
+    for k in know["language"]:
+        lines.append(f"· {k['word']}：{k['meaning']}")
+        lines.append(f"　色彩：{k['tone']}｜搭配：{k['collocation']}")
+        lines.append(f"　易混：{k['compare']}")
+    return "\n".join(lines)
 
 
 def format_questions(questions):
@@ -116,6 +167,8 @@ def build_body(now):
         parts.append("（提示：关注数据、政策表述、地点与意义三要素，常考常识判断）")
     else:
         parts.append("今日新闻源暂时不可用，请通过学习强国APP补充时政积累。")
+
+    parts.append("\n" + format_knowledge(load_knowledge(now)))
 
     parts.append("\n【今日打卡任务】\n" + " | ".join(TASKS))
 
