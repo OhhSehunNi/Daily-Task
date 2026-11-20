@@ -44,6 +44,10 @@ TASKS = [
     "申论素材摘抄 1条",
     "错题回顾 3-5道",
 ]
+# Bark 单次推送正文上限（UTF-8 字节）：受 APNs 4096 字节与反向代理约 8KB 双重限制，
+# 取 3700 留足 title / JSON 包装 / 引号与换行转义余量；超出时自动拆成多条推送。
+# send_bark 已用 ensure_ascii=False 避免中文被转义成 \\uXXXX 导致体积翻倍。
+MAX_BODY_BYTES = 3700
 
 
 def resolve_data_dir(now):
@@ -186,24 +190,46 @@ def build_body(now):
     return "\n".join(parts)
 
 
+def split_text_by_bytes(text, max_bytes):
+    """按 UTF-8 字节长度切分文本，优先在换行处断开，避免把一行截成两半。"""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return [text]
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        # 单行本身超限：按字符前缀硬切，保证单块字节数不超过 max_bytes
+        while len(line.encode("utf-8")) > max_bytes:
+            cut = line.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+            chunks.append(cut)
+            line = line[len(cut):]
+        candidate = cur + ("\n" if cur else "") + line
+        if len(candidate.encode("utf-8")) > max_bytes and cur:
+            chunks.append(cur + "\n")  # 保留换行，避免下一片首行与本片粘连
+            cur = line
+        else:
+            cur = candidate
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def send_bark(title, body):
-    """调用 Bark 推送接口。"""
+    """调用 Bark 推送接口；成功打印，HTTP 413 抛出 urllib.error.HTTPError 供上层降级重试。"""
     key = os.environ.get("BARK_DEVICE_KEY")
     if not key:
         print("错误：未设置 BARK_DEVICE_KEY 环境变量（GitHub Secrets 中配置）")
         sys.exit(1)
     # 注意用 or 兜底：若环境变量存在但为空串（Secret 未配置时 GitHub 会注入空值），也回退到默认服务器
     server = os.environ.get("BARK_SERVER") or "https://api.day.app"
-    payload = json.dumps({"device_key": key, "title": title, "body": body, "group": "省考打卡"}).encode("utf-8")
+    # ensure_ascii=False：中文按 UTF-8 原样发送，避免被转义为 \uXXXX 使体积翻倍触发 413
+    payload = json.dumps({"device_key": key, "title": title, "body": body, "group": "省考打卡"},
+                         ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"{server}/push", data=payload, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
         result = json.loads(resp.read().decode("utf-8"))
-    if result.get("code") == 200:
-        print("推送成功")
-    else:
-        print(f"推送失败：{result}")
-        sys.exit(1)
+    if result.get("code") != 200:
+        raise RuntimeError(f"推送失败：{result}")
+    print("推送成功")
 
 
 def main():
@@ -213,7 +239,25 @@ def main():
     if "--dry-run" in sys.argv:
         print(f"标题：{title}\n{'=' * 30}\n{body}")
         return
-    send_bark(title, body)
+    # 正文超长时拆成多条推送（每条在 Bark 体积上限内）；遇到 413 则二分回退重试
+    limit = MAX_BODY_BYTES
+    while True:
+        chunks = split_text_by_bytes(body, limit)
+        total = len(chunks)
+        try:
+            for i, chunk in enumerate(chunks, 1):
+                t = title if total == 1 else f"{title}（{i}/{total}）"
+                send_bark(t, chunk)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 413 and limit > 500:
+                limit = limit // 2
+                continue
+            print(f"推送失败：HTTP {e.code} {e.reason}")
+            sys.exit(1)
+        except RuntimeError as e:
+            print(e)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
